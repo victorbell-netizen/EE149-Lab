@@ -1,0 +1,99 @@
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+import Bump from "lib/Bump.lf"
+import Display from "lib/Display.lf"
+import GyroAngle from "lib/IMU.lf"
+import Motors from "lib/Motors.lf"
+
+main reactor {
+  display = new Display()
+  motors = new Motors()
+  bump = new Bump(sample_period = 10 ms)
+  gyro = new GyroAngle()
+
+  timer gyro_sample(0, 50 ms)
+
+  state start_angle: float = 0.0
+  state angle_initialized: bool = false
+
+  reaction(gyro_sample) -> gyro.trigger {=
+    lf_set(gyro.trigger, true);
+  =}
+
+  initial mode DRIVE {
+    reaction(startup) -> motors.left_power, motors.right_power,
+        display.line0 {=
+      // Calibrated straight-line forward motion.
+      lf_set(motors.left_power, 0.1f);
+      lf_set(motors.right_power, 0.093f);
+      lf_set(display.line0, "DRIVING");
+    =}
+
+    reaction(reset) -> motors.left_power, motors.right_power,
+        display.line0 {=
+      lf_set(motors.left_power, 0.1f);
+      lf_set(motors.right_power, 0.093f);
+      lf_set(display.line0, "DRIVING");
+    =}
+
+    reaction(bump.left) -> reset(BACK_OFF), motors.left_power,
+        motors.right_power, display.line0 {=
+      lf_set(motors.left_power, -0.1f);
+      lf_set(motors.right_power, -0.093f);
+      lf_set(display.line0, "LEFT BUMP");
+      lf_set_mode(BACK_OFF);
+    =}
+
+    reaction(bump.right) -> reset(BACK_OFF), motors.left_power,
+        motors.right_power, display.line0 {=
+      lf_set(motors.left_power, -0.1f);
+      lf_set(motors.right_power, -0.093f);
+      lf_set(display.line0, "RIGHT BUMP");
+      lf_set_mode(BACK_OFF);
+    =}
+  }
+
+  mode BACK_OFF {
+    timer reverse_time(400 ms)
+
+    reaction(reverse_time) -> reset(TURN), motors.left_power,
+        motors.right_power, display.line0 {=
+      // Turn in place after reversing.
+      lf_set(motors.left_power, -0.2f);
+      lf_set(motors.right_power, 0.2f);
+      lf_set(display.line0, "TURNING");
+      lf_set_mode(TURN);
+    =}
+  }
+
+  mode TURN {
+    reaction(reset) -> motors.left_power, motors.right_power,
+        display.line0 {=
+      self->angle_initialized = false;
+      lf_set(motors.left_power, -0.2f);
+      lf_set(motors.right_power, 0.2f);
+      lf_set(display.line0, "TURNING");
+    =}
+
+    reaction(gyro.z) -> reset(DRIVE), motors.left_power,
+        motors.right_power, display.line0 {=
+      if (!self->angle_initialized) {
+        self->start_angle = gyro.z->value;
+        self->angle_initialized = true;
+      }
+
+      if (gyro.z->value - self->start_angle >= 75.0f) {
+        lf_set(motors.left_power, 0.0f);
+        lf_set(motors.right_power, 0.0f);
+        lf_set(display.line0, "DRIVING");
+        lf_set_mode(DRIVE);
+      }
+    =}
+  }
+}

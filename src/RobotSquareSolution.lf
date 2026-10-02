@@ -1,0 +1,113 @@
+/**
+ * Drive approximately 0.5 m, turn approximately 90 degrees, and repeat.
+ */
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+import Display from "lib/Display.lf"
+import Encoders from "lib/Encoders.lf"
+import GyroAngle from "lib/IMU.lf"
+import Motors from "lib/Motors.lf"
+
+main reactor {
+  display = new Display()
+  motors = new Motors()
+  encoders = new Encoders()
+  gyro = new GyroAngle()
+
+  // Sample encoders and gyroscope every 50 ms.
+  timer sample(0, 50 ms)
+
+  state start_left: int32_t = 0
+  state start_right: int32_t = 0
+  state start_angle: float = 0.0
+
+  state distance_initialized: bool = false
+  state angle_initialized: bool = false
+
+  reaction(startup) -> display.line0 {=
+    lf_set(display.line0, "SQUARE");
+  =}
+
+  reaction(sample) -> encoders.trigger, gyro.trigger {=
+    lf_set(encoders.trigger, true);
+    lf_set(gyro.trigger, true);
+  =}
+
+  initial mode DRIVE {
+    reaction(startup) -> motors.left_power, motors.right_power,
+        display.line1 {=
+      lf_set(motors.left_power, 0.1f);
+      lf_set(motors.right_power, 0.093f);
+      lf_set(display.line1, "DRIVING");
+    =}
+
+    reaction(reset) -> motors.left_power, motors.right_power,
+        display.line1 {=
+      self->distance_initialized = false;
+
+      lf_set(motors.left_power, 0.1f);
+      lf_set(motors.right_power, 0.093f);
+      lf_set(display.line1, "DRIVING");
+    =}
+
+    reaction(encoders.left, encoders.right) -> reset(TURN),
+        motors.left_power, motors.right_power {=
+      const float radius_m = 0.015875f;
+
+      if (!self->distance_initialized) {
+        self->start_left = encoders.left->value;
+        self->start_right = encoders.right->value;
+        self->distance_initialized = true;
+      }
+
+      float left_distance =
+          (encoders.left->value - self->start_left) *
+          3.14159265f * radius_m / 180.0f;
+
+      float right_distance =
+          (encoders.right->value - self->start_right) *
+          3.14159265f * radius_m / 180.0f;
+
+      float average_distance =
+          (left_distance + right_distance) / 2.0f;
+
+      if (average_distance >= 0.50f) {
+        lf_set(motors.left_power, 0.0f);
+        lf_set(motors.right_power, 0.0f);
+        lf_set_mode(TURN);
+      }
+    =}
+  }
+
+  mode TURN {
+    reaction(reset) -> motors.left_power, motors.right_power,
+        display.line1 {=
+      self->angle_initialized = false;
+
+      // Opposite motor powers rotate the robot in place.
+      lf_set(motors.left_power, -0.1f);
+      lf_set(motors.right_power, 0.1f);
+      lf_set(display.line1, "TURNING");
+    =}
+
+    reaction(gyro.z) -> reset(DRIVE), motors.left_power,
+        motors.right_power {=
+      if (!self->angle_initialized) {
+        self->start_angle = gyro.z->value;
+        self->angle_initialized = true;
+      }
+
+      if (gyro.z->value - self->start_angle >= 75.0f) {
+        lf_set(motors.left_power, 0.0f);
+        lf_set(motors.right_power, 0.0f);
+        lf_set_mode(DRIVE);
+      }
+    =}
+  }
+}
