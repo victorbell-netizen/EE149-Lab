@@ -1,0 +1,223 @@
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+import Display from "lib/Display.lf"
+import Accelerometer, GyroAngle from "lib/IMU.lf"
+import Encoders from "lib/Encoders.lf"
+import MotorsWithFeedback from "lib/MotorsWithFeedback.lf"
+import Tilt from "lib/Tilt.lf"
+
+preamble {=
+  #include <math.h>
+=}
+
+main reactor(sample_period: time = 50 ms) {
+  display = new Display()
+  accelerometer = new Accelerometer()
+  gyro = new GyroAngle()
+  encoders = new Encoders()
+  tilt = new Tilt()
+  motors = new MotorsWithFeedback()
+
+  timer sample(0, sample_period)
+  timer flat_check(1 sec, 200 ms)
+
+  state pitch_value: float = 0.0
+  state saw_slope: bool = false
+  state start_angle: float = 0.0
+  state angle_initialized: bool = false
+
+  accelerometer.x, accelerometer.y, accelerometer.z
+    -> tilt.x, tilt.y, tilt.z
+
+  encoders.left, encoders.right
+    -> motors.left, motors.right
+
+  reaction(sample) -> accelerometer.trigger, gyro.trigger,
+      encoders.trigger {=
+    lf_set(accelerometer.trigger, true);
+    lf_set(gyro.trigger, true);
+    lf_set(encoders.trigger, true);
+  =}
+
+  initial mode CLIMB {
+    reaction(startup) -> motors.left_speed, motors.right_speed,
+        display.line0 {=
+      self->saw_slope = false;
+
+      lf_set(motors.left_speed, 0.15f);
+      lf_set(motors.right_speed, 0.15f);
+      lf_set(display.line0, "CLIMBING");
+    =}
+
+    reaction(tilt.pitch, tilt.roll) -> motors.left_speed,
+        motors.right_speed, display.line1 {=
+      const float base_speed = 0.15f;
+      const float kp = 0.0003f;
+
+      self->pitch_value = tilt.pitch->value;
+
+      if (fabsf(self->pitch_value) > 5.0f) {
+        self->saw_slope = true;
+      }
+
+      float correction = kp * tilt.pitch->value * tilt.roll->value;
+
+      float left_speed = base_speed - correction;
+      float right_speed = base_speed + correction;
+
+      if (left_speed < 0.05f) {
+        left_speed = 0.05f;
+      }
+
+      if (left_speed > 0.22f) {
+        left_speed = 0.22f;
+      }
+
+      if (right_speed < 0.05f) {
+        right_speed = 0.05f;
+      }
+
+      if (right_speed > 0.22f) {
+        right_speed = 0.22f;
+      }
+
+      static char text[17];
+
+      snprintf(
+          text,
+          sizeof(text),
+          "P:%2.1f R:%2.1f",
+          tilt.pitch->value,
+          tilt.roll->value
+      );
+
+      lf_set(motors.left_speed, left_speed);
+      lf_set(motors.right_speed, right_speed);
+      lf_set(display.line1, text);
+    =}
+
+    reaction(flat_check) -> reset(TURN_AROUND),
+        motors.left_speed, motors.right_speed,
+        display.line0 {=
+      if (self->saw_slope &&
+          fabsf(self->pitch_value) < 2.0f) {
+        lf_set(motors.left_speed, 0.0f);
+        lf_set(motors.right_speed, 0.0f);
+        lf_set(display.line0, "AT TOP");
+        lf_set_mode(TURN_AROUND);
+      }
+    =}
+  }
+
+  mode TURN_AROUND {
+    reaction(reset) -> motors.left_speed, motors.right_speed,
+        display.line0 {=
+      self->angle_initialized = false;
+
+      lf_set(motors.left_speed, -0.10f);
+      lf_set(motors.right_speed, 0.10f);
+      lf_set(display.line0, "TURN 180");
+    =}
+
+    reaction(gyro.z) -> reset(DESCEND),
+        motors.left_speed, motors.right_speed {=
+      if (!self->angle_initialized) {
+        self->start_angle = gyro.z->value;
+        self->angle_initialized = true;
+      }
+
+      if (fabsf(gyro.z->value - self->start_angle)
+          >= 180.0f) {
+        lf_set(motors.left_speed, 0.1f);
+        lf_set(motors.right_speed, 0.1f);
+        lf_set_mode(DESCEND);
+      }
+    =}
+  }
+
+  mode DESCEND {
+    reaction(reset) -> motors.left_speed, motors.right_speed,
+        display.line0 {=
+      self->saw_slope = false;
+
+      lf_set(motors.left_speed, 0.15f);
+      lf_set(motors.right_speed, 0.15f);
+      lf_set(display.line0, "DESCENDING");
+    =}
+
+    reaction(tilt.pitch, tilt.roll) -> motors.left_speed,
+        motors.right_speed, display.line1 {=
+      const float base_speed = 0.15f;
+      const float kp = 0.0003f;
+
+      self->pitch_value = tilt.pitch->value;
+
+      if (fabsf(self->pitch_value) > 5.0f) {
+        self->saw_slope = true;
+      }
+
+      float correction =
+          kp * tilt.pitch->value * tilt.roll->value;
+
+      float left_speed = base_speed - correction;
+      float right_speed = base_speed + correction;
+
+      if (left_speed < 0.05f) {
+        left_speed = 0.05f;
+      }
+
+      if (left_speed > 0.22f) {
+        left_speed = 0.22f;
+      }
+
+      if (right_speed < 0.05f) {
+        right_speed = 0.05f;
+      }
+
+      if (right_speed > 0.22f) {
+        right_speed = 0.22f;
+      }
+
+      static char text[17];
+
+      snprintf(
+          text,
+          sizeof(text),
+          "P:%2.1f R:%2.1f",
+          tilt.pitch->value,
+          tilt.roll->value
+      );
+
+      lf_set(motors.left_speed, left_speed);
+      lf_set(motors.right_speed, right_speed);
+      lf_set(display.line1, text);
+    =}
+
+  //   reaction(flat_check) -> reset(STOPPED),
+  //       motors.left_speed, motors.right_speed,
+  //       display.line0 {=
+  //     if (self->saw_slope &&
+  //         fabsf(self->pitch_value) < 5.0f) {
+  //       lf_set(motors.left_speed, 0.0f);
+  //       lf_set(motors.right_speed, 0.0f);
+  //       lf_set(display.line0, "DONE");
+  //       lf_set_mode(STOPPED);
+  //     }
+  //   =}
+  // }
+
+  // mode STOPPED {
+  //   reaction(reset) -> motors.left_speed, motors.right_speed,
+  //       display.line0 {=
+  //     lf_set(motors.left_speed, 0.0f);
+  //     lf_set(motors.right_speed, 0.0f);
+  //     lf_set(display.line0, "DONE");
+  //   =}
+  }
+}

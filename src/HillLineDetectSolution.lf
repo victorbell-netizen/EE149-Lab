@@ -1,0 +1,79 @@
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+import Display from "lib/Display.lf"
+import Line from "lib/Line.lf"
+
+main reactor(calibration_time: time = 10 s, sample_period: time = 100 ms) {
+  line = new Line()
+  display = new Display()
+
+  timer sample(0, sample_period)
+  timer end_calibration(calibration_time)
+
+  reaction(startup) -> display.line0, display.line1, display.line2,
+      display.line3 {=
+    lf_set(display.line0, "CALIBRATING");
+    lf_set(display.line1, "Move over light");
+    lf_set(display.line2, "and dark areas");
+    lf_set(display.line3, "");
+  =}
+
+  reaction(sample) -> line.trigger {=
+    lf_set(line.trigger, true);
+  =}
+
+  reaction(end_calibration) -> line.calibrate {=
+    lf_set(line.calibrate, false);
+  =}
+
+  reaction(line.reflect) -> display.line0, display.line1,
+      display.line2, display.line3 {=
+    const uint16_t dark_threshold = 600;
+
+    bool left =
+        line.reflect->value[0] >= dark_threshold ||
+        line.reflect->value[1] >= dark_threshold;
+
+    bool center =
+        line.reflect->value[1] >= dark_threshold ||
+        line.reflect->value[2] >= dark_threshold ||
+        line.reflect->value[3] >= dark_threshold;
+
+    bool right =
+        line.reflect->value[3] >= dark_threshold ||
+        line.reflect->value[4] >= dark_threshold;
+
+    static char status[17];
+    static char dn1[17];
+    static char dn3[17];
+    static char dn5[17];
+
+    snprintf(
+        status,
+        sizeof(status),
+        "%s%s%s",
+        left ? "Left " : "",
+        center ? "Center " : "",
+        right ? "Right" : ""
+    );
+
+    if (!left && !center && !right) {
+      snprintf(status, sizeof(status), "CLEAR");
+    }
+
+    snprintf(dn1, sizeof(dn1), "DN5: %4d", line.reflect->value[0]);
+    snprintf(dn3, sizeof(dn3), "DN3: %4d", line.reflect->value[2]);
+    snprintf(dn5, sizeof(dn5), "DN1: %4d", line.reflect->value[4]);
+
+    lf_set(display.line0, status);
+    lf_set(display.line1, dn1);
+    lf_set(display.line2, dn3);
+    lf_set(display.line3, dn5);
+  =}
+}

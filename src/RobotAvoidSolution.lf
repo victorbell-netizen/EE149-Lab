@@ -8,53 +8,98 @@ target C {
 
 import Bump from "lib/Bump.lf"
 import Display from "lib/Display.lf"
+import Encoders from "lib/Encoders.lf"
 import GyroAngle from "lib/IMU.lf"
 import Motors from "lib/Motors.lf"
+
+preamble {=
+  #include <math.h>
+=}
 
 main reactor {
   display = new Display()
   motors = new Motors()
-  bump = new Bump(sample_period = 10 ms)
+  encoders = new Encoders()
   gyro = new GyroAngle()
+  bump = new Bump(sample_period = 10 ms)
 
-  timer gyro_sample(0, 50 ms)
+  timer sample(0, 50 ms)
 
+  state start_left: int32_t = 0
+  state start_right: int32_t = 0
   state start_angle: float = 0.0
+  state distance_initialized: bool = false
   state angle_initialized: bool = false
+  state left_bump: bool = false
 
-  reaction(gyro_sample) -> gyro.trigger {=
+  reaction(startup) -> display.line0 {=
+    lf_set(display.line0, "SQUARE AVOID");
+  =}
+
+  reaction(sample) -> encoders.trigger, gyro.trigger {=
+    lf_set(encoders.trigger, true);
     lf_set(gyro.trigger, true);
   =}
 
   initial mode DRIVE {
     reaction(startup) -> motors.left_power, motors.right_power,
-        display.line0 {=
-      // Calibrated straight-line forward motion.
+        display.line1 {=
       lf_set(motors.left_power, 0.1f);
-      lf_set(motors.right_power, 0.093f);
-      lf_set(display.line0, "DRIVING");
+      lf_set(motors.right_power, 0.115f);
+      lf_set(display.line1, "DRIVING");
     =}
 
     reaction(reset) -> motors.left_power, motors.right_power,
-        display.line0 {=
+        display.line1 {=
+      self->distance_initialized = false;
       lf_set(motors.left_power, 0.1f);
-      lf_set(motors.right_power, 0.093f);
-      lf_set(display.line0, "DRIVING");
+      lf_set(motors.right_power, 0.115f);
+      lf_set(display.line1, "DRIVING");
+    =}
+
+    reaction(encoders.left, encoders.right) -> reset(TURN),
+        motors.left_power, motors.right_power {=
+      const float radius_m = 0.015875f;
+
+      if (!self->distance_initialized) {
+        self->start_left = encoders.left->value;
+        self->start_right = encoders.right->value;
+        self->distance_initialized = true;
+      }
+
+      float left_distance =
+          (encoders.left->value - self->start_left) *
+          3.14159265f * radius_m / 180.0f;
+
+      float right_distance =
+          (encoders.right->value - self->start_right) *
+          3.14159265f * radius_m / 180.0f;
+
+      float average_distance =
+          (left_distance + right_distance) / 2.0f;
+
+      if (average_distance >= 0.50f) {
+        lf_set(motors.left_power, 0.0f);
+        lf_set(motors.right_power, 0.0f);
+        lf_set_mode(TURN);
+      }
     =}
 
     reaction(bump.left) -> reset(BACK_OFF), motors.left_power,
-        motors.right_power, display.line0 {=
+        motors.right_power, display.line1 {=
+      self->left_bump = true;
       lf_set(motors.left_power, -0.1f);
-      lf_set(motors.right_power, -0.093f);
-      lf_set(display.line0, "LEFT BUMP");
+      lf_set(motors.right_power, -0.115f);
+      lf_set(display.line1, "LEFT BUMP");
       lf_set_mode(BACK_OFF);
     =}
 
     reaction(bump.right) -> reset(BACK_OFF), motors.left_power,
-        motors.right_power, display.line0 {=
+        motors.right_power, display.line1 {=
+      self->left_bump = false;
       lf_set(motors.left_power, -0.1f);
-      lf_set(motors.right_power, -0.093f);
-      lf_set(display.line0, "RIGHT BUMP");
+      lf_set(motors.right_power, -0.115f);
+      lf_set(display.line1, "RIGHT BUMP");
       lf_set_mode(BACK_OFF);
     =}
   }
@@ -62,27 +107,57 @@ main reactor {
   mode BACK_OFF {
     timer reverse_time(400 ms)
 
-    reaction(reverse_time) -> reset(TURN), motors.left_power,
-        motors.right_power, display.line0 {=
-      // Turn in place after reversing.
-      lf_set(motors.left_power, -0.2f);
-      lf_set(motors.right_power, 0.2f);
-      lf_set(display.line0, "TURNING");
-      lf_set_mode(TURN);
+    reaction(reverse_time) -> reset(AVOID_TURN), motors.left_power,
+        motors.right_power, display.line1 {=
+      lf_set(motors.left_power, 0.0f);
+      lf_set(motors.right_power, 0.0f);
+      lf_set(display.line1, "AVOID TURN");
+      lf_set_mode(AVOID_TURN);
+    =}
+  }
+
+  mode AVOID_TURN {
+    reaction(reset) -> motors.left_power, motors.right_power,
+        display.line1 {=
+      self->angle_initialized = false;
+
+      if (self->left_bump) {
+        lf_set(motors.left_power, 0.1f);
+        lf_set(motors.right_power, -0.115f);
+      } else {
+        lf_set(motors.left_power, -0.1f);
+        lf_set(motors.right_power, 0.115f);
+      }
+
+      lf_set(display.line1, "AVOID TURN");
+    =}
+
+    reaction(gyro.z) -> reset(DRIVE), motors.left_power,
+        motors.right_power {=
+      if (!self->angle_initialized) {
+        self->start_angle = gyro.z->value;
+        self->angle_initialized = true;
+      }
+
+      if (fabsf(gyro.z->value - self->start_angle) >= 75.0f) {
+        lf_set(motors.left_power, 0.0f);
+        lf_set(motors.right_power, 0.0f);
+        lf_set_mode(DRIVE);
+      }
     =}
   }
 
   mode TURN {
     reaction(reset) -> motors.left_power, motors.right_power,
-        display.line0 {=
+        display.line1 {=
       self->angle_initialized = false;
-      lf_set(motors.left_power, -0.2f);
-      lf_set(motors.right_power, 0.2f);
-      lf_set(display.line0, "TURNING");
+      lf_set(motors.left_power, -0.1f);
+      lf_set(motors.right_power, 0.115f);
+      lf_set(display.line1, "TURNING");
     =}
 
     reaction(gyro.z) -> reset(DRIVE), motors.left_power,
-        motors.right_power, display.line0 {=
+        motors.right_power {=
       if (!self->angle_initialized) {
         self->start_angle = gyro.z->value;
         self->angle_initialized = true;
@@ -91,7 +166,6 @@ main reactor {
       if (gyro.z->value - self->start_angle >= 75.0f) {
         lf_set(motors.left_power, 0.0f);
         lf_set(motors.right_power, 0.0f);
-        lf_set(display.line0, "DRIVING");
         lf_set_mode(DRIVE);
       }
     =}

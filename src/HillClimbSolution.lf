@@ -1,0 +1,144 @@
+target C {
+  platform: {
+    name: "rp2040",
+    board: "pololu_3pi_2040_robot"
+  },
+  single-threaded: true
+}
+
+import Display from "lib/Display.lf"
+import Line from "lib/Line.lf"
+import Motors from "lib/Motors.lf"
+
+reactor Tilt {
+    input x: float
+    input y: float
+    input z: float
+
+    output pitch: float
+    output roll: float
+
+    reaction(x, y, z) -> pitch, roll {=
+            float xv = x->value;
+            float yv = y->value;
+            float zv = z->value;
+
+            float pitch_rad = atan2f(xv,sqrt(yv*yv + zv*zv));
+            float roll_rad = atan2f(yv,sqrt(xv*xv + zv*zv));
+
+            // float roll_rad = atan2f(z->value,y->value);
+
+            // convert to degree
+            float pitch_d = pitch_rad * (180/M_PI);
+            float roll_d = roll_rad *(180/M_PI);
+
+            lf_set(pitch, pitch_d);
+            lf_set(roll, roll_d);
+        =}
+
+    }
+
+main reactor(calibration_time: time = 10 s, sample_period: time = 50 ms) {
+  line = new Line()
+  display = new Display()
+  motors = new Motors()
+  tilt = new Tilt()
+
+  timer sample(0, sample_period)
+  timer end_calibration(calibration_time)
+
+  state turn_right: bool = false
+
+  reaction(startup) -> display.line0, display.line1,
+      motors.left_power, motors.right_power {=
+    lf_set(display.line0, "CALIBRATING");
+    lf_set(display.line1, "MOVE LIGHT/DARK");
+    lf_set(motors.left_power, 0.0f);
+    lf_set(motors.right_power, 0.0f);
+  =}
+
+  reaction(sample) -> line.trigger {=
+    lf_set(line.trigger, true);
+  =}
+
+  reaction(end_calibration) -> line.calibrate {=
+    lf_set(line.calibrate, false);
+  =}
+
+  initial mode DRIVE {
+    reaction(reset) -> motors.left_power, motors.right_power,
+        display.line0 {=
+      lf_set(motors.left_power, 0.1f);
+      lf_set(motors.right_power, 0.1f);
+      lf_set(display.line0, "DRIVING");
+    =}
+
+    reaction(line.reflect) -> reset(BACK_OFF), motors.left_power,
+        motors.right_power, display.line0 {=
+      const uint16_t threshold = 600;
+
+      bool left =
+          line.reflect->value[0] >= threshold ||
+          line.reflect->value[1] >= threshold;
+
+      bool center =
+          line.reflect->value[1] >= threshold ||
+          line.reflect->value[2] >= threshold ||
+          line.reflect->value[3] >= threshold;
+
+      bool right =
+          line.reflect->value[3] >= threshold ||
+          line.reflect->value[4] >= threshold;
+
+      if (left || center || right) {
+        if (left && !right) {
+          self->turn_right = true;
+          lf_set(display.line0, "LEFT EDGE");
+        } else if (right && !left) {
+          self->turn_right = false;
+          lf_set(display.line0, "RIGHT EDGE");
+        } else {
+          self->turn_right = true;
+          lf_set(display.line0, "CENTER EDGE");
+        }
+
+        lf_set(motors.left_power, -0.1f);
+        lf_set(motors.right_power, -0.1f);
+        lf_set_mode(BACK_OFF);
+      }
+    =}
+  }
+
+  mode BACK_OFF {
+    timer reverse_time(400 ms)
+
+    reaction(reverse_time) -> reset(TURN), motors.left_power,
+        motors.right_power, display.line0 {=
+      lf_set(motors.left_power, 0.0f);
+      lf_set(motors.right_power, 0.0f);
+      lf_set(display.line0, "TURNING");
+      lf_set_mode(TURN);
+    =}
+  }
+
+  mode TURN {
+    timer turn_time(350 ms)
+
+    reaction(reset) -> motors.left_power, motors.right_power {=
+      if (self->turn_right) {
+        lf_set(motors.left_power, 0.1f);
+        lf_set(motors.right_power, -0.1f);
+      } else {
+        lf_set(motors.left_power, -0.1f);
+        lf_set(motors.right_power, 0.1f);
+      }
+    =}
+
+    reaction(turn_time) -> reset(DRIVE), motors.left_power,
+        motors.right_power {=
+      lf_set(motors.left_power, 0.1f);
+      lf_set(motors.right_power, 0.1f);
+      lf_set_mode(DRIVE);
+    =}
+  }
+}
