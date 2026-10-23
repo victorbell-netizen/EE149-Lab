@@ -1,0 +1,343 @@
+target C {
+  platform: "RP2040",
+  single-threaded: true,
+  keepalive: true
+}
+
+import Display from "lib/Display.lf"
+
+preamble {=
+  #include <stdio.h>
+  #include <stdlib.h>
+  #include <stdint.h>
+  #include <hardware/gpio.h>
+  #include <hardware/irq.h>
+  #include <hardware/timer.h> // time_us_64(): full hardware timestamp.
+  #include <hardware/structs/timer.h>
+  #include <pico/stdlib.h>
+
+  #define ALARM_NUM 0
+=}
+
+main reactor {
+  display = new Display()
+
+  preamble {=
+    typedef void (*virtual_timer_callback_t)(void);
+
+    typedef struct node_t {
+      // 9.2.7: use a full 64-bit absolute deadline so list ordering stays
+      // correct when the lower 32 bits of the hardware counter wrap.
+      uint64_t timer_value;
+
+      // Function to call when this virtual timer expires.
+      virtual_timer_callback_t callback;
+
+      // NEW 9.2.5: true for a repeating timer, false for a one-shot timer.
+      bool repeated;
+
+      // NEW 9.2.5: interval between scheduled expirations, in microseconds.
+      uint32_t period;
+
+      // Pointer to the next timer in the sorted linked list.
+      struct node_t* next;
+    } node_t;
+
+    // The head is always the earliest timer deadline.
+    static node_t* linked_list = NULL;
+
+    // 9.2.7: a running callback may cancel its own timer.
+    // Delay freeing this active node until the callback returns.
+    static node_t* active_timer = NULL;
+    static bool active_cancelled = false;
+
+    // NEW 9.2.8: prevent recursive servicing when a callback starts/cancels
+    // a timer. The outer service loop will see all those list changes.
+    static bool servicing_timers = false;
+
+    // Checkoff counters: inspect these in a debugger without printing in IRQs.
+    static volatile uint32_t led_callback_count = 0;
+    static volatile uint32_t idle_callback_count = 0;
+
+    // State used by the LED callback.
+    static bool led_state = false;
+
+    // Insert node into the linked list in increasing timer_value order.
+    void list_insert_sorted(node_t* node) {
+      if (linked_list == NULL) {
+        node->next = NULL;
+        linked_list = node;
+      } else if (linked_list->timer_value > node->timer_value) {
+        node->next = linked_list;
+        linked_list = node;
+      } else {
+        node_t* prev_node = linked_list;
+        node_t* curr_node = linked_list->next;
+
+        while (curr_node != NULL &&
+               curr_node->timer_value < node->timer_value) {
+          prev_node = curr_node;
+          curr_node = curr_node->next;
+        }
+
+        prev_node->next = node;
+        node->next = curr_node;
+      }
+    }
+
+    // Remove a particular node from the linked list.
+    void list_remove(node_t* node) {
+      if (linked_list == NULL) {
+        return;
+      }
+
+      if (linked_list == node) {
+        linked_list = linked_list->next;
+      } else {
+        node_t* prev_node = linked_list;
+        node_t* curr_node = linked_list->next;
+
+        while (curr_node != NULL && curr_node != node) {
+          prev_node = curr_node;
+          curr_node = curr_node->next;
+        }
+
+        if (curr_node != NULL) {
+          prev_node->next = curr_node->next;
+        }
+      }
+    }
+
+    // Remove and return the first node, which is the earliest timer.
+    node_t* list_remove_first() {
+      node_t* head = linked_list;
+
+      if (head != NULL) {
+        linked_list = head->next;
+      }
+
+      return head;
+    }
+
+    // 9.2.8 checkoff callback: toggle the assumed active-low LED.
+    void led0_toggle(void) {
+      led_callback_count++;
+      led_state = !led_state;
+      gpio_put(PICO_DEFAULT_LED_PIN, !led_state);
+    }
+
+    // 9.2.7 checkoff: separate callbacks set a definite LED state.
+    // These retain the active-low LED assumption of the previous tasks.
+    void led_on(void) {
+      led_state = true;
+      gpio_put(PICO_DEFAULT_LED_PIN, false);
+    }
+
+    void led_off(void) {
+      led_state = false;
+      gpio_put(PICO_DEFAULT_LED_PIN, true);
+    }
+
+    // 9.2.8 checkoff: no LED action. Count calls for optional debugging.
+    void do_nothing(void) {
+      idle_callback_count++;
+    }
+
+    // NEW 9.2.8: disable only the timer IRQ and remember its previous state.
+    // All timer API calls belong on the same core as this IRQ handler.
+    bool virtual_timer_lock(void) {
+      bool was_enabled = irq_is_enabled(TIMER_IRQ_0);
+      irq_set_enabled(TIMER_IRQ_0, false);
+      return was_enabled;
+    }
+
+    void virtual_timer_unlock(bool was_enabled) {
+      irq_set_enabled(TIMER_IRQ_0, was_enabled);
+    }
+
+    // NEW 9.2.8: process expired timers and arm the next future deadline
+    // as one protected operation. Call only with TIMER_IRQ_0 disabled.
+    void virtual_timer_service(void) {
+      if (servicing_timers) {
+        return;  // A callback called a timer API; the outer loop will finish.
+      }
+      servicing_timers = true;
+
+      for (;;) {
+        // Clear both sources of an old request before inspecting deadlines.
+        // This prevents a queued interrupt from executing a callback twice.
+        timer_hw->armed = 1u << ALARM_NUM;
+        timer_hw->intr = 1u << ALARM_NUM;
+        irq_clear(TIMER_IRQ_0);
+
+        // Re-read time for every node: a callback may take long enough for
+        // another timer to expire. Equal deadlines are handled here too.
+        while (linked_list != NULL &&
+               linked_list->timer_value <= time_us_64()) {
+          node_t* expired_timer = list_remove_first();
+          active_timer = expired_timer;
+          active_cancelled = false;
+
+          // Callbacks must be short and safe in interrupt context.
+          // An overdue callback can also run inside a start/cancel API call.
+          if (expired_timer->callback != NULL) {
+            expired_timer->callback();
+          }
+
+          if (expired_timer->repeated && !active_cancelled) {
+            // Keep the same node/ID and advance from its previous deadline.
+            expired_timer->timer_value += expired_timer->period;
+            list_insert_sorted(expired_timer);
+          } else {
+            free(expired_timer);
+          }
+          active_timer = NULL;
+        }
+
+        if (linked_list == NULL) {
+          break;  // Empty list: leave the hardware alarm disarmed.
+        }
+
+        uint64_t deadline = linked_list->timer_value;
+        timer_hw->alarm[ALARM_NUM] = (uint32_t)deadline;
+
+        // Critical edge case: the deadline may pass between checking the
+        // list and writing ALARM0. Check AGAIN after programming the alarm.
+        if (time_us_64() < deadline) {
+          break;  // A future deadline is armed; pending new IRQs are valid.
+        }
+
+        // Already due: loop, disarm/clear this request, and run its callback
+        // now. Do not wait for another hardware counter match.
+      }
+      servicing_timers = false;
+    }
+
+    void lab5_timer_irq_handler(void) {
+      bool was_enabled = virtual_timer_lock();
+      virtual_timer_service();
+      virtual_timer_unlock(was_enabled);
+    }
+
+    void virtual_timer_init(void) {
+      // Register the handler and clear old alarm state before enabling it.
+      irq_set_exclusive_handler(TIMER_IRQ_0, lab5_timer_irq_handler);
+      timer_hw->armed = 1u << ALARM_NUM;
+      timer_hw->intr = 1u << ALARM_NUM;
+      irq_clear(TIMER_IRQ_0);
+      timer_hw->inte |= 1u << ALARM_NUM;
+      irq_set_enabled(TIMER_IRQ_0, true);
+    }
+
+    // Shared creation logic retained from 9.2.7, with 9.2.8 protection.
+    uint32_t virtual_timer_create(
+        uint32_t microseconds,
+        virtual_timer_callback_t cb,
+        bool repeated
+    ) {
+      bool was_enabled = virtual_timer_lock();
+      uint32_t timer_id = 0;
+
+      // Reject a zero repeating period, but still service other due timers.
+      if (!repeated || microseconds != 0) {
+        node_t* node = malloc(sizeof(node_t));
+        if (node != NULL) {
+          node->timer_value = time_us_64() + microseconds;
+          node->callback = cb;
+          node->repeated = repeated;
+          node->period = repeated ? microseconds : 0;
+          node->next = NULL;
+          list_insert_sorted(node);
+
+          // Save the ID before servicing: a very short one-shot may fire
+          // and be freed before this function returns.
+          timer_id = (uint32_t)(uintptr_t)node;
+        }
+      }
+
+      // Handle overdue nodes before returning, including allocation failure.
+      virtual_timer_service();
+      virtual_timer_unlock(was_enabled);
+      return timer_id;
+    }
+
+    uint32_t virtual_timer_start(
+        uint32_t microseconds,
+        virtual_timer_callback_t cb
+    ) {
+      return virtual_timer_create(microseconds, cb, false);
+    }
+
+    uint32_t virtual_timer_start_repeated(
+        uint32_t microseconds,
+        virtual_timer_callback_t cb
+    ) {
+      return virtual_timer_create(microseconds, cb, true);
+    }
+
+    // Cancellation retained from 9.2.6; use the same protected service path.
+    void virtual_timer_cancel(uint32_t timer_id) {
+      bool was_enabled = virtual_timer_lock();
+
+      if (timer_id != 0) {
+        if (active_timer != NULL &&
+            (uint32_t)(uintptr_t)active_timer == timer_id) {
+          // A callback cancels itself: free it only after the callback returns.
+          active_cancelled = true;
+        } else {
+          node_t* node = linked_list;
+          while (node != NULL && (uint32_t)(uintptr_t)node != timer_id) {
+            node = node->next;
+          }
+          if (node != NULL) {
+            list_remove(node);
+            free(node);
+          }
+        }
+      }
+
+      virtual_timer_service();
+      virtual_timer_unlock(was_enabled);
+      // IDs are node addresses: discard an ID once its timer is freed.
+    }
+
+  =}
+
+  // Used only to display the hardware counter every second.
+  timer print_hw_timer(0, 1000 ms)
+
+  reaction(startup) {=
+    stdio_init_all();
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    led_off();
+    virtual_timer_init();
+
+    // 9.2.8 CHECKOFF: both timers must keep running indefinitely.
+    // Their expirations occur very close together around every even second.
+    uint32_t led_id = virtual_timer_start_repeated(1000000, led0_toggle);
+    uint32_t idle_id = virtual_timer_start_repeated(2000000, do_nothing);
+
+    // Report allocation failure only at startup, outside timer callbacks.
+    if (led_id == 0 || idle_id == 0) {
+      printf("Unable to allocate checkoff timers.\n");
+    }
+    // No cancellation action: the LED should keep toggling every second.
+  =}
+
+  reaction(print_hw_timer) -> display.line0 {=
+    static char text[17];
+
+    // Read the lower 32 bits of the hardware timer in microseconds.
+    uint32_t time_us = timer_hw->timelr;
+
+    snprintf(
+        text,
+        sizeof(text),
+        "%lu us",
+        (unsigned long)time_us
+    );
+
+    lf_set(display.line0, text);
+  =}
+}

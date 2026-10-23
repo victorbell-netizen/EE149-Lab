@@ -1,0 +1,205 @@
+
+target C {
+  platform: "RP2040",
+  single-threaded: true,
+  keepalive: true
+}
+
+import Display from "lib/Display.lf"
+
+preamble {=
+  #include <hardware/gpio.h>
+  #include <hardware/structs/timer.h>
+  #include <hardware/irq.h>
+  #include <pico/stdlib.h>
+  #include <stdio.h>
+
+  #define ALARM_NUM 0
+=}
+
+main reactor {
+  display = new Display()
+
+  preamble {=
+    typedef void (*virtual_timer_callback_t)(void);
+
+    // Definition of linked list node
+    typedef struct node_t {
+      /* Put the variables needed for linked list node here */
+      // value for the timer
+      uint32_t timer_value;
+
+      /*********************************************
+          DO NOT CHANGE THE CODE BELOW
+      *********************************************/
+      // next node pointer
+      struct node_t* next;
+    } node_t;
+
+    //The linked list for timer
+    static node_t* linked_list = NULL;
+
+    // linked list operation functions
+    // insert the node in the sorted linked list (linked_list) and return the sorted linked list after the insertion
+    void list_insert_sorted(node_t* node){
+       if(linked_list == NULL){
+          node -> next = NULL;
+          linked_list = node;
+       }
+       else{
+          if(linked_list -> timer_value > node -> timer_value){
+              node -> next = linked_list;
+              linked_list = node;
+            }
+          else{
+              // node is somewhere after the head
+              node_t* prev_node = linked_list;
+              node_t* curr_node = linked_list->next;
+              while(curr_node != NULL && curr_node -> timer_value < node -> timer_value){
+                  // iterate until end of list or the current node has a greater value
+                  prev_node = curr_node;
+                  curr_node = curr_node -> next;
+              }
+              // insert node
+              prev_node -> next = node;
+              node -> next = curr_node;
+          }
+       }
+    }
+
+    // remove the node from linked list
+    void list_remove(node_t* node){
+        if(linked_list != NULL){
+            if(linked_list == node){
+                linked_list = linked_list -> next;
+            }
+            else{
+                node_t* prev_node = linked_list;
+                node_t* curr_node = linked_list -> next;
+                while(curr_node != NULL && curr_node != node){
+                    prev_node = curr_node;
+                    curr_node = curr_node -> next;
+                }
+                if(curr_node != NULL){
+                    prev_node -> next = curr_node -> next;
+                }
+            }
+        }
+    }
+
+    // return and remove the first node in the linked list
+    node_t* list_remove_first(){
+      node_t* head = linked_list;
+      if (head != NULL) {
+          linked_list = head->next;
+      }
+      return head;
+    }
+
+    /*********************************************
+        DO NOT CHANGE THE  #include<pico/stdlib.h> CODE ABOVE
+    *********************************************/
+
+    /* You can also create your own linked list functions here. */
+
+    void lab5_timer_irq_handler(void){
+        // 9.2.3: Clear alarm 0's interrupt event.
+        // INTR is write-one-to-clear: writing 1 acknowledges it.
+        timer_hw->intr = 1u << ALARM_NUM;
+
+        // Print once when the hardware alarm fires.
+        printf("Timer Fired!\n");
+
+        // Hardware automatically disarms the alarm when it fires.
+        // Do not rearm it here: this section requires one firing.
+    }
+
+    void virtual_timer_init(void){
+
+        // Enable alarm 0's interrupt in the timer peripheral.
+        timer_hw->inte |= 1u << ALARM_NUM;
+        // 2.3: Register the interrupt handler for alarm 0.
+        irq_set_exclusive_handler(
+            TIMER_IRQ_0,
+            lab5_timer_irq_handler
+        );
+
+
+
+        // Enable the corresponding processor interrupt.
+        irq_set_enabled(TIMER_IRQ_0, true);
+    }
+
+    uint32_t virtual_timer_start(
+        uint32_t microseconds,
+        virtual_timer_callback_t cb
+    ){
+       
+        (void)cb;
+
+        // Read the current hardware counter in microseconds.
+        uint32_t now = timer_hw->timelr;
+
+        // Set the absolute deadline and arm alarm 0.
+        // The hardware counter continues running without resetting.
+        timer_hw->alarm[ALARM_NUM] = now + microseconds;
+        return 0;
+    }
+
+    uint32_t virtual_timer_start_repeated(
+        uint32_t microseconds,
+        virtual_timer_callback_t cb
+    ){
+    
+        (void)microseconds;
+        (void)cb;
+        return 0;
+    }
+
+    void virtual_timer_cancel(uint32_t time_id){
+        (void)time_id;
+    }
+  =}
+
+  // 9.2.2: Trigger an OLED timer reading every second.
+  timer print_hw_timer(0, 1000ms)
+
+  reaction(startup) {=
+      // initialize the LED and the virtual timer
+      gpio_init(PICO_DEFAULT_LED_PIN);
+      gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+      gpio_put(PICO_DEFAULT_LED_PIN, true);
+
+      // Enable the hardware alarm interrupt.
+      virtual_timer_init();
+
+      // Start a one-shot alarm for ten seconds from now.
+      // 10 seconds = 10,000,000 microseconds.
+      // No callback is needed for this section.
+      virtual_timer_start(10000000u, NULL);
+  =}
+
+  reaction(print_hw_timer) -> display.line0 {=
+      // 9.2.2: Display the hardware timer value in microseconds.
+      // Static storage keeps the text valid after this reaction.
+      static char text[32];
+
+      // Read the lower 32 bits of the running hardware counter.
+      uint32_t time_us = timer_hw->timelr;
+
+      // Convert the numeric value into a string.
+      snprintf(
+          text,
+          sizeof(text),
+          "%lu us",
+          (unsigned long)time_us
+      );
+
+      // Send the text to the first line of the OLED.
+      lf_set(display.line0, text);
+  =}
+
+  //  test: startup arms the hardware alarm once.
+  // The interrupt handler prints "Timer Fired!" after ten seconds.
+  // The LF timer above independently keeps the OLED updating.
+}
